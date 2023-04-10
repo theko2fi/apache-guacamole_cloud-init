@@ -1,0 +1,276 @@
+## template: jinja
+#cloud-config
+
+
+# the user account to access to the server terminal via SSH
+{% set default_user = "guacamoleuser" %}
+
+# {# RECOMMENDED to change #}
+{% set default_user_pass = "guacamolepass" %}
+
+# define docker-compose version
+{% set dockercompose_version = "3.9" %}
+
+# optionally set the FQDN
+# if not defined, your server's public IP will be automatically determined
+# And your Guacamole instance will be reachable at https://141-80-202-45.traefik.me/guacamole
+# Where 141.80.202.45 is for example the public IP of your host
+# {# set fqdn = "guacamole.company.local" #}
+
+# {# RECOMMENDED to change #}
+# define postgres parameters
+{% set postgres_user = "guacamole_db_user" %}
+{% set postgres_password = "gcZYye@7U89JF%" %}
+{% set postgres_version = "15.0" %}
+
+# define guacamole containers version
+{% set guacamole_backend_version = "1.5.0" %}
+{% set guacamole_frontend_version = "1.5.0" %}
+
+# define haproxy docker container version
+{% set haproxy_version = "2.4" %}
+
+# define the folder to house configuration files
+{% set installation_path = "/home/{}/docker-stack".format(default_user) %}
+
+# create the docker group
+groups:
+  - docker
+
+# create default_user account
+users:
+  - default
+  - name: {{ default_user }}
+    groups: sudo, docker
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    homedir: /home/{{ default_user }}
+{% if default_user_pass %}
+    lock_passwd: false
+    ssh_pwauth: true
+{% endif %}
+{% if ssh_key is defined %}
+    ssh_authorized_keys:
+      - {{ ssh_key }}
+{% endif %}
+
+# update software packages
+package_update: true
+package_upgrade: true
+
+# install some required packages
+packages:
+  - nano
+  - curl
+  - jq
+
+# write configuration files for Apache Guacamole and HAproxy
+write_files:
+- path: {{ installation_path }}/guacamole/docker-compose.yml
+  content: |
+    version: '{{ dockercompose_version }}'
+    # networks
+    # create a network 'guacamole_net' in mode 'bridged'
+    networks:
+      guacamole_net:
+        driver: bridge
+      haproxy_net:
+        external: true
+    # services
+    services:
+      # guacd
+      guacd:
+        container_name: guacamole_backend
+        image: guacamole/guacd:{{ guacamole_backend_version }}
+        networks:
+          guacamole_net:
+        restart: always
+        volumes:
+        - ./drive:/drive:rw
+        - ./record:/record:rw
+      # postgres
+      postgres:
+        container_name: guacamole_database
+        environment:
+          PGDATA: /var/lib/postgresql/data/guacamole
+          POSTGRES_DB: guacamole_db
+          POSTGRES_PASSWORD: '${POSTGRES_PASSWORD}'
+          POSTGRES_USER: '${POSTGRES_USER}'
+        image: postgres:{{ postgres_version }}
+        networks:
+          guacamole_net:
+        restart: always
+        volumes:
+        - ./init:/docker-entrypoint-initdb.d:ro
+        - ./data:/var/lib/postgresql/data:rw
+      # guacamole
+      guacamole:
+        container_name: guacamole_frontend
+        depends_on:
+        - guacd
+        - postgres
+        environment:
+          GUACD_HOSTNAME: guacd
+          POSTGRES_DATABASE: guacamole_db
+          POSTGRES_HOSTNAME: postgres
+          POSTGRES_PASSWORD: '${POSTGRES_PASSWORD}'
+          POSTGRES_USER: '${POSTGRES_USER}'
+          POSTGRESQL_AUTO_CREATE_ACCOUNTS: true
+        image: guacamole/guacamole:{{ guacamole_frontend_version }}
+        links:
+        - guacd
+        networks:
+          - guacamole_net
+          - haproxy_net
+        restart: always
+        volumes:
+        - ./drive:/drive:rw
+
+- path: {{ installation_path }}/guacamole/.env
+  content: |
+    POSTGRES_PASSWORD={{ postgres_password }}
+    POSTGRES_USER={{ postgres_user }}
+
+- path: {{ installation_path }}/haproxy/docker-compose.yml
+  content: |
+    version: '{{ dockercompose_version }}'
+    services:
+      haproxy:
+        container_name: haproxy
+        image: haproxytech/haproxy-alpine:{{ haproxy_version }}
+        ports:
+          - 80:80
+          - 443:443
+          - 8404:8404
+        volumes:
+          - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+          - ./certs:/usr/local/etc/haproxy/certs/
+        networks:
+          - haproxy_net
+        restart: always
+        environment:
+          ENDPOINT: '${ENDPOINT}'
+{% if not fqdn %}
+      reverse-proxy-https-helper:
+        image: alpine
+        command: sh -c "cd /etc/ssl/traefik
+          && wget traefik.me/cert.pem -O - >> traefik.me.pem
+          && wget traefik.me/privkey.pem -O - >> traefik.me.pem"
+        volumes:
+          - ./certs:/etc/ssl/traefik
+{% endif %}
+    networks:
+      haproxy_net:
+        name: haproxy_net
+        driver: bridge
+
+- path: {{ installation_path }}/haproxy/haproxy.cfg
+  content: |
+    global
+      stats socket /var/run/api.sock user haproxy group haproxy mode 660 level admin expose-fd listeners
+      log stdout format raw local0 info
+      maxconn 50000
+
+    resolvers docker_resolver
+      nameserver dns 127.0.0.11:53
+
+    defaults
+      mode http
+      timeout client 10s
+      timeout connect 5s
+      timeout server 10s
+      timeout http-request 10s
+      default-server init-addr none
+      log global
+
+    frontend stats
+      bind *:8404
+      stats enable
+      stats uri /
+      stats refresh 10s
+
+    frontend myfrontend
+      mode http
+      bind :80
+      bind :443 ssl crt /usr/local/etc/haproxy/certs/
+      http-request redirect scheme https code 301 if !{ ssl_fc }
+      use_backend %[req.hdr(Host),lower]
+
+    backend "${ENDPOINT}"
+      server guacamole guacamole:8080 check inter 10s resolvers docker_resolver
+
+- path: {{ installation_path }}/endpoint.sh
+  content: |
+    #!/bin/bash
+
+    set -ex
+
+    METHOD="${1:-${METHOD:-cloud}}"
+
+    publicIpFromInterface() {
+      echo "Couldn't find a valid ipv4 address, using the first IP found on the interfaces as the PUBLICIP."
+      DEFAULT_INTERFACE="$(ip -4 route list match default | grep -Eo "dev .*" | awk '{print $2}')"
+      PUBLICIP=$(ip -4 addr sh dev "$DEFAULT_INTERFACE" | grep -w inet | head -n1 | awk '{print $2}' | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b')
+      PUBLIC_IP_FMT="${PUBLICIP//[.]/-}"
+      echo ENDPOINT="${PUBLIC_IP_FMT}.traefik.me" | tee {{ installation_path }}/haproxy/.env
+    }
+
+    publicIpFromMetadata() {
+      if curl -s http://169.254.169.254/metadata/v1/vendor-data | grep DigitalOcean >/dev/null; then
+        PUBLICIP="$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)"
+      elif test "$(curl -s http://169.254.169.254/latest/meta-data/services/domain)" = "amazonaws.com"; then
+        PUBLICIP="$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
+      elif test "$(curl -s -H Metadata:true --noproxy '*' 'http://169.254.169.254/metadata/instance/compute/provider/?api-version=2021-02-01&format=text')" = "Microsoft.Compute"; then
+        PUBLICIP="$(curl -H Metadata:true --noproxy '*' 'http://169.254.169.254:80/metadata/loadbalancer?api-version=2020-10-01&format=text'|jq -r '.loadbalancer.publicIpAddresses[0].frontendIpAddress')"
+      elif host -t A -W 10 metadata.google.internal 127.0.0.53 >/dev/null; then
+        PUBLICIP="$(curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip")"
+      fi
+
+      if echo "${PUBLICIP}" | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b"; then
+        PUBLIC_IP_FMT="${PUBLICIP//[.]/-}"
+        echo ENDPOINT="${PUBLIC_IP_FMT}.traefik.me" | tee {{ installation_path }}/haproxy/.env
+      else
+        publicIpFromInterface
+      fi
+    }
+
+    if test "$METHOD" = "cloud"; then
+      publicIpFromMetadata
+    fi
+  permissions: '0755'
+
+- path: {{ installation_path }}/setpass.sh
+  content: |
+    #!/bin/bash
+
+    set -ex
+
+    sed 's/PasswordAuthentication no/PasswordAuthentication yes/' -i /etc/ssh/sshd_config
+    systemctl restart sshd
+    service sshd restart
+
+    echo "{{default_user}}:{{default_user_pass}}" | chpasswd
+  permissions: '0755'
+
+# Configure and deploy Guacamole
+runcmd:
+{% if default_user_pass %}
+  - 'bash {{ installation_path }}/setpass.sh'
+{% endif %}
+  - 'curl -fsSL https://get.docker.com -o get-docker.sh'
+  - |
+    sh get-docker.sh | grep -qE "ERROR: Unsupported distribution 'rocky'|ERROR: Unsupported distribution 'almalinux'" && sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  - 'systemctl start docker'
+  - 'systemctl enable docker'
+  - 'mkdir -p {{ installation_path }}/guacamole/init >/dev/null 2>&1'
+  - 'chmod -R +x {{ installation_path }}/guacamole/init'
+  - 'docker run --rm guacamole/guacamole /opt/guacamole/bin/initdb.sh --postgres > {{ installation_path }}/guacamole/init/initdb.sql'
+  - 'mkdir -p {{ installation_path }}/haproxy/certs'
+{% if fqdn %}
+  - 'echo ENDPOINT={{ fqdn }} | tee {{ installation_path }}/haproxy/.env'
+  - bash -c 'openssl req -nodes -newkey rsa:2048 -new -x509 -keyout /dev/stdout -out /dev/stdout -subj "/CN={{ fqdn }}" > {{ installation_path }}/haproxy/certs/{{ fqdn }}.pem'
+{% else %}
+  - 'bash {{ installation_path }}/endpoint.sh'
+{% endif %}
+  - 'chown -R {{ default_user }}:{{ default_user }} {{ installation_path }}/'
+  - 'docker compose -f {{ installation_path }}/haproxy/docker-compose.yml up -d && docker compose -f {{ installation_path }}/guacamole/docker-compose.yml up -d'
